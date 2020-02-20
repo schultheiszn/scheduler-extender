@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: pause-pod
+  name: pod-deployment
+spec:
+  selector:
+    matchLabels:
+        app: pause-pod
+  replicas: 5
+  template:
+    metadata:
+      labels:
+        app: pause-pod
+    spec:
+      schedulerName: myscheduler
+      containers:
+      - name: pause-pod-by-myscheduler
+        image: k8s.gcr.io/pause:2.0
+

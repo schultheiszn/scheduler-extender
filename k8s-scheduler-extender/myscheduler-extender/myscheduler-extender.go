@@ -2,37 +2,46 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
+	"strings"
 
 	"github.com/julienschmidt/httprouter"
-
 	v1 "k8s.io/api/core/v1"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/extender/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	extenderv1 "k8s.io/kubernetes/pkg/scheduler/apis/extender/v1"
 )
 
-func Index(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	fmt.Fprint(w, "Welcome to sample-scheduler-extender!\n")
-	log.Print("myscheduler-extender Index")
-}
+const (
+	Percent = 0.3
+	RSKind = "ReplicaSet"
+)
+
+type GetPodsByNodeNameFunc func(ns string, nodeName string) ([]v1.Pod, error)
 
 func Filter(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	log.Print("myscheduler-extender Filter")
-	var buf bytes.Buffer
-	body := io.TeeReader(r.Body, &buf)
-	var extenderArgs schedulerapi.ExtenderArgs
-	var extenderFilterResult *schedulerapi.ExtenderFilterResult
+	var buff bytes.Buffer
+	var extenderArgs extenderv1.ExtenderArgs
+	var extenderFilterResult *extenderv1.ExtenderFilterResult
+
+	body := io.TeeReader(r.Body, &buff)
+
 	if err := json.NewDecoder(body).Decode(&extenderArgs); err != nil {
-		extenderFilterResult = &schedulerapi.ExtenderFilterResult{
-			Error: err.Error(),
-		}
+		extenderFilterResult = &extenderv1.ExtenderFilterResult{Error: err.Error()}
 	} else {
 		extenderFilterResult = filter(extenderArgs)
 	}
+
+	log.Printf("%+v", extenderFilterResult)
 
 	if response, err := json.Marshal(extenderFilterResult); err != nil {
 		log.Fatalln(err)
@@ -44,14 +53,15 @@ func Filter(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 }
 
 func Prioritize(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	log.Print("myscheduler-extender Prioritize")
 	var buf bytes.Buffer
+	var extenderArgs extenderv1.ExtenderArgs
+	var hostPriorityList *extenderv1.HostPriorityList
+
 	body := io.TeeReader(r.Body, &buf)
-	var extenderArgs schedulerapi.ExtenderArgs
-	var hostPriorityList *schedulerapi.HostPriorityList
+
 	if err := json.NewDecoder(body).Decode(&extenderArgs); err != nil {
 		log.Println(err)
-		hostPriorityList = &schedulerapi.HostPriorityList{}
+		hostPriorityList = &extenderv1.HostPriorityList{}
 	} else {
 		hostPriorityList = prioritize(extenderArgs)
 	}
@@ -65,22 +75,13 @@ func Prioritize(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	}
 }
 
-const (
-	// lucky priority gives a random [0, schedulerapi.MaxPriority] score
-	// currently schedulerapi.MaxPriority is 10
-	luckyPrioMsg = "pod %v/%v is lucky to get score %v\n"
-)
-
-func prioritize(args schedulerapi.ExtenderArgs) *schedulerapi.HostPriorityList {
-	pod := args.Pod
+func prioritize(args extenderv1.ExtenderArgs) *extenderv1.HostPriorityList {
 	nodes := args.Nodes.Items
 
-	hostPriorityList := make(schedulerapi.HostPriorityList, len(nodes))
+	hostPriorityList := make(extenderv1.HostPriorityList, len(nodes))
 	for i, node := range nodes {
-		// score := rand.Intn(math.MaxInt32) //schedulerapi.MaxExtenderPriority)
-		score := rand.Int63n(schedulerapi.MaxExtenderPriority)
-		log.Printf(luckyPrioMsg, pod.Name, pod.Namespace, score)
-		hostPriorityList[i] = schedulerapi.HostPriority{
+		score := rand.Int63n(extenderv1.MaxExtenderPriority)
+		hostPriorityList[i] = extenderv1.HostPriority{
 			Host:  node.Name,
 			Score: score,
 		}
@@ -89,36 +90,120 @@ func prioritize(args schedulerapi.ExtenderArgs) *schedulerapi.HostPriorityList {
 	return &hostPriorityList
 }
 
-func filter(args schedulerapi.ExtenderArgs) *schedulerapi.ExtenderFilterResult {
-	// var filteredNodes []v1.Node
-	failedNodes := make(schedulerapi.FailedNodesMap)
-	// pod := args.Pod
+func isReplicaSet(ref *metav1.OwnerReference) bool {
+	if ref != nil && ref.Kind == RSKind {
+		return true
+	}
+	return false
+}
 
-	// for _, node := range args.Nodes.Items {
-	//fits, failReasons, _ := true, nil, nil //podFitsOnNode(pod, node)
-	//if fits {
-	// filteredNodes = append(filteredNodes, node)
-	//} else {
-	//	failedNodes[node.Name] = strings.Join(failReasons, ",")
-	//}
-	// }
-	result := schedulerapi.ExtenderFilterResult{
+func getReplicaSetOwnerRef(refs *[]metav1.OwnerReference) *metav1.OwnerReference {
+	for _, owner := range *refs {
+		if isReplicaSet(&owner) {
+			return &owner
+		}
+	}
+	return nil
+}
+
+func filter(args extenderv1.ExtenderArgs) *extenderv1.ExtenderFilterResult {
+	pod := args.Pod
+	var filteredNodes []v1.Node
+	failedNodes := make(extenderv1.FailedNodesMap)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	podInfo, err := CS.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+
+	ownerReference := getReplicaSetOwnerRef(&podInfo.OwnerReferences)
+	if ownerReference != nil {
+		limit, ok := M[ownerReference.Name]
+		if !ok {
+			rs, err := CS.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, ownerReference.Name, metav1.GetOptions{})
+			if err != nil {
+				panic(err.Error())
+			}
+			var m int
+			switch rs.Spec.Replicas {
+			case nil: m = 1
+			default: m  = int(*rs.Spec.Replicas)
+			}
+			M[ownerReference.Name] = int(math.Round(float64(m) * Percent))
+		}
+
+		for _, node := range args.Nodes.Items {
+			podList, err := getPodsAssignedToNode()(node.Namespace, node.Name)
+			if err != nil {
+				failedNodes[node.Name] = err.Error()
+			} else {
+				count := 0
+				for _, podOnNode := range podList {
+					if strings.HasPrefix(podOnNode.Name, ownerReference.Name) {
+						count++
+					}
+				}
+				if count >= limit {
+					failedNodes[node.Name] = fmt.Sprintf("Node[%s] could not accept more pod from replica set[%s]", node.Name, ownerReference.Name)
+				} else {
+					filteredNodes = append(filteredNodes, node)
+				}
+			}
+		}
+	} else {
+		filteredNodes = args.Nodes.Items
+	}
+
+	result := extenderv1.ExtenderFilterResult{
 		Nodes: &v1.NodeList{
-			Items: args.Nodes.Items,
+			Items: filteredNodes,
 		},
 		FailedNodes: failedNodes,
 		Error:       "",
 	}
+	log.Printf("%+v", result)
 
 	return &result
 }
 
+func getPodsAssignedToNode() GetPodsByNodeNameFunc {
+	return func(ns string, nodeName string) ([]v1.Pod, error) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		selector := fields.SelectorFromSet(fields.Set{"spec.nodeName": nodeName})
+		pods, err := CS.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+			FieldSelector: selector.String(),
+		})
+		if err != nil {
+			return []v1.Pod{}, fmt.Errorf("failed to get Pods assigned to node %v", nodeName)
+		}
+		return pods.Items, nil
+	}
+}
+
+var CS *kubernetes.Clientset
+var M map[string]int
+
+func init() {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	clientSet, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	CS = clientSet
+	M = make(map[string]int)
+}
+
 func main() {
-	log.Print("myscheduler-extender init")
+	log.Print("Scheduler extender init...")
 	router := httprouter.New()
-	router.GET("/", Index)
 	router.POST("/filter", Filter)
 	router.POST("/prioritize", Prioritize)
-
-	log.Fatal(http.ListenAndServe("0.0.0.0:8888", router))
+	log.Fatal(http.ListenAndServe(":8888", router))
 }

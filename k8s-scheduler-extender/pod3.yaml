@@ -3,10 +3,10 @@ kind: Pod
 metadata:
   name: test-pod-myscheduler
   labels:
-    name: multischeduler-example
+    name: myscheduler-pod-example
 spec:
   schedulerName: myscheduler
   containers:
-  - name: pod-with-second-annotation-container
+  - name: pod-scheduled-by-myscheduler
     image: k8s.gcr.io/pause:2.0
 

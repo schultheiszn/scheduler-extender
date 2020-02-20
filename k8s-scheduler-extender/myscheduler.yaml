@@ -70,6 +70,7 @@ spec:
       - command: 
         name: myscheduler-extender
         image: gcr.io/banzaicloud-scheduler/scheduler-extender-small:1.0
+        imagePullPolicy: Always
         ports:
           - containerPort: 8888
       - command:
@@ -88,7 +89,7 @@ spec:
             path: /healthz
             port: 10251
           initialDelaySeconds: 15
-        name: kube-second-scheduler
+        name: myscheduler-scheduler
         readinessProbe:
           httpGet:
             path: /healthz
