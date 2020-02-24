@@ -27,6 +27,11 @@ const (
 )
 
 type GetPodsByNodeNameFunc func(ns string, nodeName string) ([]v1.Pod, error)
+type PerNodeControl struct  {
+	threshold int
+	current int
+	skiprest bool
+}
 
 func Filter(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	var buff bytes.Buffer
@@ -120,7 +125,7 @@ func filter(args extenderv1.ExtenderArgs) *extenderv1.ExtenderFilterResult {
 
 	ownerReference := getReplicaSetOwnerRef(&podInfo.OwnerReferences)
 	if ownerReference != nil {
-		limit, ok := M[ownerReference.Name]
+		limiter, ok := M[ownerReference.Name]
 		if !ok {
 			rs, err := CS.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, ownerReference.Name, metav1.GetOptions{})
 			if err != nil {
@@ -128,27 +133,31 @@ func filter(args extenderv1.ExtenderArgs) *extenderv1.ExtenderFilterResult {
 			}
 			var m int
 			switch rs.Spec.Replicas {
-			case nil: m = 1
-			default: m  = int(*rs.Spec.Replicas)
+				case nil: m = 1
+				default: m  = int(*rs.Spec.Replicas)
 			}
-			M[ownerReference.Name] = int(math.Round(float64(m) * Percent))
+			M[ownerReference.Name] = PerNodeControl{int(math.Round(float64(m) * Percent)), 0, false}
 		}
 
 		for _, node := range args.Nodes.Items {
-			podList, err := getPodsAssignedToNode()(node.Namespace, node.Name)
-			if err != nil {
-				failedNodes[node.Name] = err.Error()
+			if limiter.skiprest {
+				filteredNodes = append(filteredNodes, node)
 			} else {
-				count := 0
-				for _, podOnNode := range podList {
-					if strings.HasPrefix(podOnNode.Name, ownerReference.Name) {
-						count++
-					}
-				}
-				if count >= limit {
-					failedNodes[node.Name] = fmt.Sprintf("Node[%s] could not accept more pod from replica set[%s]", node.Name, ownerReference.Name)
+				podList, err := getPodsAssignedToNode()(node.Namespace, node.Name)
+				if err != nil {
+					failedNodes[node.Name] = err.Error()
 				} else {
-					filteredNodes = append(filteredNodes, node)
+					for _, podOnNode := range podList {
+						if strings.HasPrefix(podOnNode.Name, ownerReference.Name) {
+							limiter.current++
+						}
+					}
+					if limiter.current >= limiter.threshold {
+						limiter.skiprest = true
+						failedNodes[node.Name] = fmt.Sprintf("Node[%s] could not accept more pod from replica set[%s]", node.Name, ownerReference.Name)
+					} else {
+						filteredNodes = append(filteredNodes, node)
+					}
 				}
 			}
 		}
@@ -163,7 +172,7 @@ func filter(args extenderv1.ExtenderArgs) *extenderv1.ExtenderFilterResult {
 		FailedNodes: failedNodes,
 		Error:       "",
 	}
-	log.Printf("%+v", result)
+	log.Printf("%+v", M)
 
 	return &result
 }
@@ -184,7 +193,7 @@ func getPodsAssignedToNode() GetPodsByNodeNameFunc {
 }
 
 var CS *kubernetes.Clientset
-var M map[string]int
+var M map[string]PerNodeControl
 
 func init() {
 	config, err := rest.InClusterConfig()
@@ -197,7 +206,7 @@ func init() {
 		panic(err.Error())
 	}
 	CS = clientSet
-	M = make(map[string]int)
+	M = make(map[string]PerNodeControl)
 }
 
 func main() {
